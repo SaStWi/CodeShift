@@ -16,23 +16,6 @@ Key characteristics:
 - Memory Efficient: Uses 16 MB chunked streaming to handle large game files (100 GB+) with minimal RAM consumption.
 - Dual Interface: Includes both a desktop graphical user interface (Tkinter) and a full command-line interface (CLI).
 
-## Supported Game Engines
-
-The tool detects and handles the following engines:
-- Construct 3 (c3ab / assets.dat, asar, data.json decompilation to readable event sheets and global variables)
-- Unity (UnityFS, AssetBundles, Assembly-CSharp.dll .NET metadata, BepInEx mod injection)
-- Unreal Engine 4 and 5 (unencrypted .pak archives, IoStore detection, UE4SS mod injection)
-- Godot Engine 3 and 4 (standalone and embedded .pck archives, project.binary recovery)
-- GameMaker Studio 1 and 2 (data.win IFF chunks, STRG string table extraction, TXTR sprites)
-- RPG Maker XP, VX, VX Ace (RGSSAD decryption, Scripts.rvdata2 decompiler to Ruby .rb files)
-- RPG Maker MV and MZ (Chromium / NW.js packages and JSON databases)
-- Ren'Py (RPA archives and RPC2 bytecode dialogue decompiler)
-- Kirikiri 2 and Kirikiri Z (.xp3 visual novel archives)
-- Defold Engine (.projectc and archive manifest files)
-- Python / PyInstaller (MEI CArchive and base_library extraction)
-- Java / LibGDX / LWJGL (.jar files and embedded class files)
-- Love2D (.love archives and embedded ZIP executables)
-- .NET / MonoGame / XNA (ECMA-335 CLR stream extraction)
 
 ## Requirements
 
