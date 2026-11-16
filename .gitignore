@@ -1,0 +1,12 @@
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Extracted game workspaces & backups
+*_extracted/
+backups/
+*.bak
+
+# Downloaded portable external tools (auto-fetched on demand)
+tools/
