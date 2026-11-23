@@ -20,6 +20,20 @@ from concurrent.futures import ThreadPoolExecutor
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
+from codeshift_backend import (
+    CancelToken,
+    OperationCancelledError,
+    InstalledGameInfo,
+    DotNetSingleFileUnpacker,
+    HashLinkDecompiler,
+    GameMakerYYCAnalyzer,
+    LuaBytecodeDecompiler,
+    WasmModuleDecompiler,
+    NativeAOTPEAnalyzer,
+    GameLibraryScanner,
+    SettingsManager,
+)
+
 # 16 MB chunked streaming buffer — allows extracting 100GB+ archives with <50 MB RAM usage
 STREAM_BUFFER_SIZE = 16 * 1024 * 1024
 
@@ -246,7 +260,15 @@ class EngineDetector:
         if head.startswith(b"PYZ\x00") or b"MEI\x0c\x0b\x0a\x0b\x0e" in tail:
             return "Python / PyInstaller"
 
-        # 15. ZIP-based or appended-ZIP containers (.c3p, .nw, .love, .jar, embedded .exe)
+        # 15. Haxe / HashLink (`hlboot.dat` `HLB` magic), Lua/LuaJIT Bytecode (`\x1bLJ` / `\x1bLua`), WebAssembly (`\x00asm`)
+        if head.startswith(b"HLB") or name_lower == "hlboot.dat":
+            return "Haxe / HashLink"
+        if head.startswith((b"\x1bLJ", b"\x1bLua")) or name_lower.endswith((".luac", ".ljbc")):
+            return "Lua / LuaJIT Bytecode"
+        if head.startswith(b"\x00asm") or name_lower.endswith(".wasm"):
+            return "WebAssembly (WASM)"
+
+        # 16. ZIP-based or appended-ZIP containers (.c3p, .nw, .love, .jar, embedded .exe)
         if zipfile.is_zipfile(file_path):
             try:
                 with zipfile.ZipFile(file_path, "r") as zf:
@@ -271,14 +293,21 @@ class EngineDetector:
             if name_lower.endswith(".jar"):
                 return "Java / LibGDX / LWJGL"
 
-        # 16. Windows PE Binary (`.exe` / `.dll`) inspection
+        # 17. Windows PE Binary (`.exe` / `.dll`) inspection — including IL2CPP-like AOT runtimes!
         if head.startswith(b"MZ"):
             if name_lower in ("gameassembly.dll", "unityplayer.dll"):
                 return "Unity"
+            if DotNetSingleFileUnpacker.find_bundle_header_offset(file_path) is not None:
+                return ".NET Single-File Bundle"
             if EngineDetector._is_dotnet_assembly(file_path):
                 if name_lower == "assembly-csharp.dll" or (file_path.parent.name.lower() == "managed"):
                     return "Unity"
                 return ".NET / MonoGame / XNA"
+            aot_fp = NativeAOTPEAnalyzer.detect_aot_runtime_fingerprint(file_path)
+            if aot_fp:
+                if "Unity IL2CPP" in aot_fp:
+                    return "Unity"
+                return aot_fp
 
         # Extension fallbacks
         if name_lower.endswith((".c3p", ".nw")):
@@ -427,6 +456,27 @@ class EngineDetector:
         if any(k in top_items for k in ("fna.dll", "monogame.framework.dll", "microsoft.xna.framework.dll")):
             return ".NET / MonoGame / XNA"
 
+        # 18. Haxe / HashLink (Dead Cells, Northgard, Wartales, Evoland, etc.)
+        if "hlboot.dat" in top_items or "libhl.dll" in top_items or any(k.endswith(".hdll") for k in top_items):
+            return "Haxe / HashLink"
+
+        # 19. WebAssembly (`.wasm`) game modules
+        if any(k.endswith(".wasm") for k in top_items):
+            return "WebAssembly (WASM)"
+
+        # 20. Lua / LuaJIT compiled bytecode games
+        if any(k.endswith((".luac", ".ljbc")) for k in top_items):
+            return "Lua / LuaJIT Bytecode"
+
+        # 21. IL2CPP-like Native AOT / Single-File Executables (.NET Single-File, NativeAOT, HXCPP, Nuitka, Cython)
+        for name, item in top_items.items():
+            if name.endswith(".exe") and item.is_file() and not name.startswith(("unins", "crash", "redist")):
+                if DotNetSingleFileUnpacker.find_bundle_header_offset(item) is not None:
+                    return ".NET Single-File Bundle"
+                aot_fp = NativeAOTPEAnalyzer.detect_aot_runtime_fingerprint(item)
+                if aot_fp:
+                    return aot_fp
+
         return "Unknown"
 
     @staticmethod
@@ -453,15 +503,24 @@ class EngineDetector:
 
 class GameExtractor:
     """
-    High-performance, multi-threaded streaming extractor & decompiler (v3.0) capable of handling
-    100GB+ games using direct disk offsets and 16 MB chunked buffers.
+    High-performance, multi-threaded streaming extractor & decompiler (v4.0) capable of handling
+    100GB+ games using direct disk offsets, 16 MB chunked buffers, cooperative cancellation,
+    and AOT/IL2CPP-like runtime analyzers.
     """
 
-    def __init__(self, log_callback=None, progress_callback=None, include_media=True, allow_network=False):
+    def __init__(
+        self,
+        log_callback=None,
+        progress_callback=None,
+        include_media=True,
+        allow_network=False,
+        cancel_token: CancelToken | None = None,
+    ):
         self.log = log_callback or (lambda msg: print(msg))
         self.set_progress = progress_callback or (lambda val: None)
         self.include_media = include_media
         self.allow_network = allow_network
+        self.cancel_token = cancel_token
 
     def extract(self, source_path: Path, output_dir: Path) -> tuple[bool, str]:
         if not source_path.exists():
@@ -488,12 +547,25 @@ class GameExtractor:
         self._write_extraction_manifest(dest, source_path, game_root, game_name, engine)
 
         try:
+            if self.cancel_token:
+                self.cancel_token.raise_if_cancelled()
+
             if engine.startswith("Construct 3") or engine in ("RPG Maker MV", "RPG Maker MZ", "Love2D"):
                 ok, msg = self._extract_construct_or_web(source_path, game_root, dest, game_name, engine)
             elif engine == "Godot":
                 ok, msg = self._extract_godot(source_path, game_root, dest, game_name)
             elif engine in ("Unity", ".NET / MonoGame / XNA"):
                 ok, msg = self._extract_unity_or_dotnet(source_path, game_root, dest, game_name, engine)
+            elif engine == ".NET Single-File Bundle":
+                ok, msg = self._extract_dotnet_single_file(source_path, game_root, dest, game_name)
+            elif engine == "Haxe / HashLink":
+                ok, msg = self._extract_hashlink(source_path, game_root, dest, game_name)
+            elif engine == "Lua / LuaJIT Bytecode":
+                ok, msg = self._extract_lua_bytecode(source_path, game_root, dest, game_name)
+            elif engine == "WebAssembly (WASM)":
+                ok, msg = self._extract_wasm(source_path, game_root, dest, game_name)
+            elif "AOT" in engine or engine in ("Haxe HXCPP (C++ AOT)", "Nuitka (Python->C++ AOT)", "Cython (Python->C AOT)", "Haxe HashLink/C (AOT)"):
+                ok, msg = self._extract_native_aot_pe(source_path, game_root, dest, game_name, engine)
             elif engine == "Unreal Engine":
                 ok, msg = self._extract_unreal(source_path, game_root, dest, game_name)
             elif engine == "Ren'Py":
@@ -529,6 +601,9 @@ class GameExtractor:
                 self.set_progress(100)
             return ok, msg
 
+        except OperationCancelledError:
+            self.log("[!] Extraction cancelled by user.")
+            return False, f"Extraction of {game_name} was cancelled by user."
         except PermissionError as exc:
             return False, format_fallback_message(
                 game_name,
@@ -1011,10 +1086,14 @@ if __name__ == "__main__":
                 )
 
             file_base = struct.unpack("<Q", f.read(8))[0] if version >= 2 else 0
-            if version >= 3 or (version == 2 and major >= 4 and (flags & 2)):
-                # Godot 4.x optional dir_offset field
-                pass
-            f.read(16 * 4)  # 16 reserved int32s
+            dir_offset = 0
+            if version >= 3:
+                dir_offset = struct.unpack("<Q", f.read(8))[0]
+                f.read(14 * 4)  # 14 remaining reserved int32s after 8-byte dir_offset
+                if dir_offset > 0:
+                    f.seek(pck_start + dir_offset)
+            else:
+                f.read(16 * 4)  # 16 reserved int32s
             file_count = struct.unpack("<I", f.read(4))[0]
 
             entries = []
@@ -1030,6 +1109,8 @@ if __name__ == "__main__":
 
             total = max(len(entries), 1)
             for idx, (rel_path, offset, size, _eflags) in enumerate(entries, 1):
+                if self.cancel_token:
+                    self.cancel_token.raise_if_cancelled()
                 if not self.include_media and Path(rel_path).suffix.lower() in MEDIA_EXTENSIONS:
                     continue
                 safe_parts = [p for p in Path(rel_path).parts if p not in ("", ".", "..", "/", "\\")]
@@ -1761,10 +1842,29 @@ if __name__ == "__main__":
                 gml_out.mkdir(parents=True, exist_ok=True)
                 subprocess.run([str(ut_cli), "dump", str(data_win), "-o", str(gml_out)], capture_output=True, text=True)
             extracted_items = self._extract_gamemaker_iff_native(data_win, dest)
+
+            # Check if this is a GameMaker YYC (YoYo Compiler — GML->C++ AOT, similar to Unity IL2CPP!)
+            yyc_note = ""
+            if GameMakerYYCAnalyzer.is_yyc_build(data_win):
+                gm_strings: list[str] = []
+                s_json = dest / "gamemaker_strings.json"
+                if s_json.is_file():
+                    try:
+                        gm_strings = json.loads(s_json.read_text(encoding="utf-8", errors="ignore"))
+                    except Exception:
+                        gm_strings = []
+                game_exe = GameRecompiler._find_game_executable(game_root)
+                yyc_res = GameMakerYYCAnalyzer.analyze_yyc(
+                    data_win, game_exe, dest / "decompiled_yyc", game_name, gm_strings, log_callback=self.log
+                )
+                if yyc_res.success:
+                    yyc_note = f"\n[+] {yyc_res.summary}"
+                    extracted_items = max(extracted_items, 1)
+
             if extracted_items > 0:
                 return (
                     True,
-                    f"Successfully extracted {extracted_items:,} strings, symbols, and embedded assets from GameMaker `{data_win.name}` to:\n{dest}\n"
+                    f"Successfully extracted {extracted_items:,} strings, symbols, and embedded assets from GameMaker `{data_win.name}` to:\n{dest}{yyc_note}\n"
                     f"(Tip: To edit compiled GML VM bytecode directly, use UndertaleModCli or UndertaleModTool).",
                 )
 
@@ -1946,6 +2046,8 @@ if __name__ == "__main__":
 
             count = 0
             for name, off, sz, subkey in entries:
+                if self.cancel_token:
+                    self.cancel_token.raise_if_cancelled()
                 if not self.include_media and Path(name).suffix.lower() in MEDIA_EXTENSIONS:
                     continue
                 safe_parts = [p for p in Path(name).parts if p not in ("", ".", "..", "/", "\\")]
@@ -1957,9 +2059,9 @@ if __name__ == "__main__":
                 data = bytearray(f.read(sz))
                 k = subkey
                 for i in range(len(data)):
-                    if i % 4 == 0 and i > 0:
-                        k = ((k * 7 + 3) & 0xFFFFFFFF) if version in (1, 2) else ((k * 7 + 3) & 0xFFFFFFFF)
-                    data[i] ^= ((k >> (8 * (i % 4))) & 0xFF)
+                    if i > 0 and (i & 3) == 0:
+                        k = (k * 7 + 3) & 0xFFFFFFFF
+                    data[i] ^= (k >> (8 * (i & 3))) & 0xFF
                 out_file.write_bytes(data)
                 count += 1
             return count
@@ -2425,6 +2527,146 @@ if __name__ == "__main__":
             game_name,
             "the game engine could not be automatically identified or uses a custom compiled binary format",
             "by inspecting the executable with Detect It Easy (DIE) to identify the engine/packer, or using QuickBMS with a game-specific unpack script.",
+        )
+
+    # =========================================================================
+    # 16. IL2CPP-LIKE AOT & SCRIPT-TO-NATIVE EXTRACTORS (HashLink, .NET Single-File,
+    #     LuaJIT/Lua Bytecode, WebAssembly, HXCPP, NativeAOT, Nuitka, Cython)
+    # =========================================================================
+
+    def _extract_hashlink(self, source_path: Path, game_root: Path, dest: Path, game_name: str) -> tuple[bool, str]:
+        hlboot = source_path if (source_path.is_file() and source_path.name.lower() == "hlboot.dat") else (game_root / "hlboot.dat")
+        if not hlboot.is_file():
+            hlboot = next(game_root.rglob("hlboot.dat"), None)
+
+        if hlboot and hlboot.is_file():
+            res = HashLinkDecompiler.decompile(hlboot, dest / "decompiled_hashlink", game_name, log_callback=self.log)
+            if res.success:
+                # Also extract any loose .pak / .json / .cdb (CastleDB used by Dead Cells / Shiro Games!)
+                cdb_files = [p for p in game_root.rglob("*") if p.is_file() and p.suffix.lower() in (".cdb", ".json", ".xml", ".ini")][:300]
+                if cdb_files:
+                    self._copy_files_parallel(game_root, cdb_files, dest / "data_configs")
+                return True, f"Successfully decompiled Haxe / HashLink (`{hlboot.name}`) to:\n{res.output_dir}\n({res.summary})"
+
+        # Fallback: HashLink/C (AOT C++ compiled HashLink!) via NativeAOTPEAnalyzer
+        exe = source_path if source_path.is_file() else GameRecompiler._find_game_executable(game_root)
+        if exe and exe.is_file():
+            res_pe = NativeAOTPEAnalyzer.analyze_binary(exe, dest / "decompiled_native_aot", game_name, log_callback=self.log)
+            if res_pe.success:
+                return True, f"Successfully analyzed HashLink/C AOT executable (`{exe.name}`) to:\n{res_pe.output_dir}\n({res_pe.summary})"
+
+        return False, format_fallback_message(
+            game_name,
+            "the Haxe / HashLink `hlboot.dat` bytecode could not be found or is encrypted",
+            "by using HashLink Tools / Haxe decompilers (`https://github.com/Gui-Yom/hlbc`) on `hlboot.dat`.",
+        )
+
+    def _extract_dotnet_single_file(self, source_path: Path, game_root: Path, dest: Path, game_name: str) -> tuple[bool, str]:
+        target_exe = source_path if source_path.is_file() else GameRecompiler._find_game_executable(game_root)
+        if not target_exe or not target_exe.is_file():
+            return False, format_fallback_message(
+                game_name,
+                "could not locate the .NET Single-File executable to unpack",
+                "by selecting the main `.exe` file directly or using ILSpy / dnSpyEx.",
+            )
+
+        res = DotNetSingleFileUnpacker.unpack(
+            target_exe, dest / "unpacked_dotnet_bundle", log_callback=self.log, cancel_token=self.cancel_token
+        )
+        if res.success:
+            # Automatically extract ECMA-335 CLR metadata & C# structural stubs from the main game DLL inside the bundle!
+            bundle_dir = dest / "unpacked_dotnet_bundle"
+            game_dll = next(
+                (d for d in bundle_dir.glob("*.dll") if game_name.lower().replace(" ", "") in d.stem.lower().replace(" ", "")),
+                None,
+            ) or next((d for d in bundle_dir.glob("*.dll") if not d.name.lower().startswith(("system.", "microsoft."))), None)
+            if game_dll:
+                self._extract_dotnet_clr_streams(game_dll, dest / "decompiled_dotnet_metadata")
+                self._decompile_dotnet_ecma335_native(game_dll, dest / "Decompiled_CSharp_Source", game_name)
+            return True, f"Successfully unpacked .NET Single-File Bundle (`{target_exe.name}`) to:\n{bundle_dir}\n({res.summary})"
+
+        return False, format_fallback_message(
+            game_name,
+            f"the .NET Single-File bundle inside `{target_exe.name}` could not be unpacked ({res.summary})",
+            "by opening the executable in ILSpy (`https://github.com/icsharpcode/ILSpy`) or `dnSpyEx`.",
+        )
+
+    def _extract_lua_bytecode(self, source_path: Path, game_root: Path, dest: Path, game_name: str) -> tuple[bool, str]:
+        targets = (
+            [source_path]
+            if source_path.is_file()
+            else [p for p in game_root.rglob("*") if p.is_file() and p.suffix.lower() in (".luac", ".ljbc", ".lua")][:1500]
+        )
+        out_lua = dest / "decompiled_lua"
+        decompiled = 0
+        copied = 0
+        for lf in targets:
+            if self.cancel_token:
+                self.cancel_token.raise_if_cancelled()
+            rel = lf.relative_to(game_root) if game_root.is_dir() and str(lf).startswith(str(game_root)) else Path(lf.name)
+            if LuaBytecodeDecompiler.decompile_file(lf, out_lua / rel.with_suffix(".decompiled.lua")):
+                decompiled += 1
+            elif lf.suffix.lower() == ".lua":
+                dst_f = out_lua / rel
+                dst_f.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(lf, dst_f)
+                copied += 1
+
+        if decompiled > 0 or copied > 0:
+            return True, f"Successfully decompiled {decompiled:,} Lua/LuaJIT bytecode files and copied {copied:,} `.lua` scripts to:\n{out_lua}"
+
+        return False, format_fallback_message(
+            game_name,
+            "the Lua/LuaJIT bytecode uses custom opcode remapping or encryption",
+            "by using `luajit-decompiler-v2` (`https://github.com/marsinator358/luajit-decompiler-v2`) or `unluac`.",
+        )
+
+    def _extract_wasm(self, source_path: Path, game_root: Path, dest: Path, game_name: str) -> tuple[bool, str]:
+        wasms = [source_path] if source_path.is_file() else list(game_root.rglob("*.wasm"))[:20]
+        parsed = 0
+        summaries = []
+        for wm in wasms:
+            res = WasmModuleDecompiler.decompile(wm, dest / "decompiled_wasm" / wm.stem)
+            if res.success:
+                parsed += 1
+                summaries.append(res.summary)
+        if parsed > 0:
+            return True, f"Successfully parsed {parsed} WebAssembly (`.wasm`) module(s) to:\n{dest / 'decompiled_wasm'}\n" + "\n".join(summaries[:5])
+
+        return False, format_fallback_message(
+            game_name,
+            "no valid WebAssembly (`\\x00asm`) module could be parsed",
+            "by running `wasm2wat` from WABT (`https://github.com/WebAssembly/wabt`) on the `.wasm` binary.",
+        )
+
+    def _extract_native_aot_pe(
+        self, source_path: Path, game_root: Path, dest: Path, game_name: str, engine: str
+    ) -> tuple[bool, str]:
+        """Handles IL2CPP-like Script-to-Native-C++ AOT binaries: HXCPP, .NET NativeAOT, Nuitka, Cython, HashLink/C."""
+        target_bin = source_path if source_path.is_file() else GameRecompiler._find_game_executable(game_root)
+        if not target_bin or not target_bin.is_file():
+            return False, format_fallback_message(
+                game_name,
+                f"could not locate the main AOT binary for {engine}",
+                "by selecting the game's primary `.exe` or `.dll` binary directly.",
+            )
+
+        res = NativeAOTPEAnalyzer.analyze_binary(
+            target_bin, dest / "decompiled_native_aot", game_name, log_callback=self.log
+        )
+        # Also extract any companion loose JSON/Lua/XML/INI configs in the game root
+        self._extract_generic_scripts_fallback(source_path, game_root, dest / "loose_configs", game_name)
+
+        if res.success:
+            return (
+                True,
+                f"Successfully analyzed IL2CPP-like AOT runtime ({res.runtime_name}) from `{target_bin.name}` to:\n"
+                f"{res.output_dir}\n({res.summary})",
+            )
+        return False, format_fallback_message(
+            game_name,
+            f"the AOT binary `{target_bin.name}` ({engine}) could not be introspected ({res.summary})",
+            "by inspecting the executable with Ghidra (`https://ghidra-sre.org/`) or x64dbg.",
         )
 
     # =========================================================================
@@ -3504,11 +3746,21 @@ class GameRecompiler:
                     continue
                 if item.is_dir():
                     if not dst.exists():
+                        linked = False
                         if sys.platform == "win32":
-                            subprocess.run(
+                            jres = subprocess.run(
                                 ["cmd", "/c", "mklink", "/J", str(dst), str(item)],
                                 capture_output=True,
                             )
+                            linked = (jres.returncode == 0 and dst.exists())
+                        if not linked:
+                            # Network share (e.g. Y:\) or non-NTFS drive where junctions fail: copy small runtime folders safely
+                            try:
+                                dir_sz = sum(f.stat().st_size for f in item.rglob("*") if f.is_file())
+                                if dir_sz < 64 * 1024 * 1024:
+                                    shutil.copytree(item, dst, dirs_exist_ok=True)
+                            except OSError:
+                                pass
                 elif item.is_file():
                     if engine == "GameMaker" and item.name.lower() == "data.win":
                         continue
@@ -4645,10 +4897,16 @@ class SafeDeployManager:
         if not ok_inj:
             return False, inj_msg
 
-        recompiler = GameRecompiler(log_callback=self.log)
-        ok_rec, modded_archive, rec_msg = recompiler.recompile(extracted_dir)
-        if not ok_rec or not modded_archive:
-            return False, rec_msg
+        # Reuse freshly recompiled artifact from `install_injector` (avoids redundant double-recompiling 100GB+ archives!)
+        updated_manifest = GameRecompiler.load_manifest(extracted_dir)
+        cached_art = Path(updated_manifest["recompiled_artifact"]) if updated_manifest.get("recompiled_artifact") else None
+        if cached_art and cached_art.is_file():
+            modded_archive = cached_art
+        else:
+            recompiler = GameRecompiler(log_callback=self.log)
+            ok_rec, modded_archive, rec_msg = recompiler.recompile(extracted_dir)
+            if not ok_rec or not modded_archive:
+                return False, rec_msg
 
         valid, verify_msg = self.verify_archive_integrity(modded_archive, engine)
         self.log(f"[*] Integrity Check: {verify_msg}")
@@ -4702,73 +4960,158 @@ class SafeDeployManager:
 
 
 class ExtractorApp(tk.Tk):
+    """
+    Usability-First 3-Tab Desktop Interface (CodeShift v4.0):
+      - Tab 1 (Extract, Inject & Run): 1-Click Installed Games Auto-Scanner (Steam/Epic/GOG/Itch),
+        Recent Games History, Persistent Output Folder, Live Stage/Timer + Cancel Button,
+        and 3-Step Workflow (`Extract` -> `Auto-Decompile, Inject & Recompile (.exe)` -> `Play (.exe)`).
+      - Tab 2 (Extracted Files & Mod Explorer): Live searchable file browser for extracted scripts,
+        JSON databases, Global Variables, AOT/RTTI dumps, and recompiled `.exe` builds.
+      - Tab 3 (Live Log & Toolchain Diagnostics): Filterable/searchable log, Save/Copy Log,
+        and 1-click Toolchain Diagnostics check (`dnSpyEx`, `Cpp2IL`, `repak`, `csc.exe`, `dotnet`).
+    """
+
     def __init__(self):
         super().__init__()
-        self.title("CodeShift — Multi-Engine Game Extractor, Decompiler & Recompiler v3.0 (18+ Engines • 100GB+ Ready)")
-        self.geometry("980x740")
+        self.title("CodeShift v4.0 — Multi-Engine Game Extractor, AOT Decompiler & Mod Recompiler (24+ Runtimes)")
+        self.geometry("1040x760")
+        self.minsize(880, 640)
         self.configure(bg="#181825")
 
+        self.settings = SettingsManager()
+        self.cancel_token = CancelToken()
+        self._installed_games: list[InstalledGameInfo] = []
+        self._quick_game_map: dict[str, InstalledGameInfo] = {}
+        self._all_log_lines: list[str] = []
+        self._explorer_files: list[tuple[str, str, str, Path]] = []
+        self._task_start_ts: float | None = None
+
         self.source_var = tk.StringVar()
-        self.output_var = tk.StringVar(value=str(Path.home() / "Desktop" / "ExtractedGames"))
+        self.output_var = tk.StringVar(value=self.settings.data.get("output_dir", str(Path.home() / "Desktop" / "ExtractedGames")))
         self.engine_var = tk.StringVar(
-            value="Select any game folder, executable, or archive (.dat, .pck, .pak, .asar, .rpa, .vpk, .pack, .pkg, global-metadata.dat)"
+            value="Pick an installed game below OR browse any folder/file (.dat, .pck, .pak, .vpk, .pack, hlboot.dat, global-metadata.dat, .wasm, .exe)"
         )
-        self.include_media_var = tk.BooleanVar(value=True)
-        self.auto_download_var = tk.BooleanVar(value=True)
+        self.stage_var = tk.StringVar(value="Idle — Ready")
+        self.include_media_var = tk.BooleanVar(value=bool(self.settings.data.get("include_media", True)))
+        self.auto_download_var = tk.BooleanVar(value=bool(self.settings.data.get("auto_download", True)))
+        self.quick_game_var = tk.StringVar(value="(Click 'Scan Installed Games' or press F5)")
+        self.recent_var = tk.StringVar(value="Recent Games...")
+        self.file_filter_var = tk.StringVar()
+        self.log_filter_var = tk.StringVar(value="All")
+        self.log_search_var = tk.StringVar()
 
         self._build_ui()
+        self._bind_shortcuts()
+        self._refresh_recent_combo()
+        # Automatically scan installed Steam/Epic/GOG games in background on startup for instant 1-click usability!
+        self.after(250, self._scan_installed_games)
 
     def _build_ui(self):
         style = ttk.Style(self)
         style.theme_use("clam")
         style.configure("TFrame", background="#181825")
         style.configure("TLabel", background="#181825", foreground="#cdd6f4", font=("Segoe UI", 10))
-        style.configure("Header.TLabel", font=("Segoe UI", 15, "bold"), foreground="#89b4fa")
+        style.configure("Header.TLabel", font=("Segoe UI", 14, "bold"), foreground="#89b4fa")
+        style.configure("Sub.TLabel", font=("Segoe UI", 9), foreground="#a6adc8")
         style.configure("TButton", font=("Segoe UI", 10, "bold"), padding=6)
         style.configure("TCheckbutton", background="#181825", foreground="#cdd6f4", font=("Segoe UI", 10))
+        style.configure("TNotebook", background="#181825", borderwidth=0)
+        style.configure("TNotebook.Tab", background="#313244", foreground="#cdd6f4", padding=[14, 6], font=("Segoe UI", 10, "bold"))
+        style.map("TNotebook.Tab", background=[("selected", "#89b4fa")], foreground=[("selected", "#11111b")])
+        style.configure("Treeview", background="#11111b", foreground="#cdd6f4", fieldbackground="#11111b", font=("Consolas", 9))
+        style.configure("Treeview.Heading", background="#313244", foreground="#cdd6f4", font=("Segoe UI", 9, "bold"))
 
-        main = ttk.Frame(self, padding=20)
-        main.pack(fill=tk.BOTH, expand=True)
+        outer = ttk.Frame(self, padding=14)
+        outer.pack(fill=tk.BOTH, expand=True)
 
+        # Compact Header Bar
+        hdr = ttk.Frame(outer)
+        hdr.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(hdr, text="CodeShift v4.0 — Game Extractor, AOT Decompiler & Mod Recompiler", style="Header.TLabel").pack(anchor="w")
         ttk.Label(
-            main,
-            text="CodeShift — Multi-Engine Game Extractor, Decompiler & Mod Recompiler (v3.0)",
-            style="Header.TLabel",
+            hdr,
+            text="Shortcuts: Ctrl+O Folder • Ctrl+Shift+O File • Ctrl+Enter Extract • F5 Scan Games • Esc Cancel  |  Supports 100GB+ & IL2CPP-like AOT Runtimes",
+            style="Sub.TLabel",
         ).pack(anchor="w")
-        ttk.Label(
-            main,
-            text="Unity (Mono & IL2CPP / Among Us) • Construct 3 (c3ab/NW.js/Electron) • Unreal 4/5 • Godot 3/4 • Source/VPK • Total War • GameMaker • RPG Maker • Ren'Py",
-        ).pack(anchor="w", pady=(2, 12))
 
-        ttk.Label(main, text="Step 1 — Select Game Folder or Any Game File (100GB+ supported via direct disk streaming):").pack(anchor="w")
-        src_row = ttk.Frame(main)
+        self.notebook = ttk.Notebook(outer)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+
+        self.tab_main = ttk.Frame(self.notebook, padding=14)
+        self.tab_files = ttk.Frame(self.notebook, padding=14)
+        self.tab_logs = ttk.Frame(self.notebook, padding=14)
+
+        self.notebook.add(self.tab_main, text="  1. Extract, Inject & Run  ")
+        self.notebook.add(self.tab_files, text="  2. Extracted Files & Mod Explorer  ")
+        self.notebook.add(self.tab_logs, text="  3. Live Log & Diagnostics  ")
+
+        self._build_main_tab()
+        self._build_files_tab()
+        self._build_logs_tab()
+
+        # Bottom Persistent Status & Progress Bar (Visible across all tabs!)
+        status_bar = ttk.Frame(outer)
+        status_bar.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(status_bar, textvariable=self.stage_var, foreground="#f9e2af").pack(side=tk.LEFT)
+        self.cancel_btn = ttk.Button(status_bar, text="Cancel Task (Esc)", command=self._cancel_active_task, state=tk.DISABLED)
+        self.cancel_btn.pack(side=tk.RIGHT, padx=(8, 0))
+        self.progress = ttk.Progressbar(outer, orient=tk.HORIZONTAL, mode="determinate")
+        self.progress.pack(fill=tk.X, pady=(4, 0))
+
+    def _build_main_tab(self):
+        m = self.tab_main
+
+        # Quick-Pick Installed Games Bar (Huge usability boost — zero manual path hunting!)
+        ttk.Label(m, text="Quick-Pick Installed Game (Steam / Epic / GOG / Itch) or Recent:").pack(anchor="w")
+        quick_row = ttk.Frame(m)
+        quick_row.pack(fill=tk.X, pady=(4, 10))
+        self.quick_combo = ttk.Combobox(quick_row, textvariable=self.quick_game_var, state="readonly", font=("Segoe UI", 10))
+        self.quick_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        self.quick_combo.bind("<<ComboboxSelected>>", self._on_quick_game_selected)
+        ttk.Button(quick_row, text="Scan Games (F5)", command=self._scan_installed_games).pack(side=tk.LEFT, padx=(0, 6))
+        self.recent_combo = ttk.Combobox(quick_row, textvariable=self.recent_var, state="readonly", width=26, font=("Segoe UI", 9))
+        self.recent_combo.pack(side=tk.LEFT)
+        self.recent_combo.bind("<<ComboboxSelected>>", self._on_recent_selected)
+
+        # Step 1: Source Selection
+        ttk.Label(m, text="Step 1 — Selected Game Folder or Any Game Archive/Executable (100GB+ streaming supported):").pack(anchor="w")
+        src_row = ttk.Frame(m)
         src_row.pack(fill=tk.X, pady=(4, 6))
-        ttk.Entry(src_row, textvariable=self.source_var, font=("Segoe UI", 10)).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
-        ttk.Button(src_row, text="Select Game Folder", command=self._pick_source_folder).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(src_row, text="Select Game File", command=self._pick_source_file).pack(side=tk.LEFT)
+        self.src_entry = ttk.Entry(src_row, textvariable=self.source_var, font=("Segoe UI", 10))
+        self.src_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        self.src_entry.bind("<FocusOut>", lambda _e: self._on_source_path_changed())
+        self.src_entry.bind("<Return>", lambda _e: self._on_source_path_changed())
+        ttk.Button(src_row, text="Browse Folder...", command=self._pick_source_folder).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(src_row, text="Browse File...", command=self._pick_source_file).pack(side=tk.LEFT)
 
-        ttk.Label(main, textvariable=self.engine_var, foreground="#a6e3a1").pack(anchor="w", pady=(0, 8))
+        ttk.Label(m, textvariable=self.engine_var, foreground="#a6e3a1", wraplength=960).pack(anchor="w", pady=(0, 10))
 
-        ttk.Label(main, text="Step 2 — Choose Where to Extract & Recompile the Game on Your Computer:").pack(anchor="w")
-        out_row = ttk.Frame(main)
+        # Step 2: Output Folder Selection
+        ttk.Label(m, text="Step 2 — Output Folder (Where Extracted Source Code & Runnable Modded .exe Will Be Saved):").pack(anchor="w")
+        out_row = ttk.Frame(m)
         out_row.pack(fill=tk.X, pady=(4, 8))
         ttk.Entry(out_row, textvariable=self.output_var, font=("Segoe UI", 10)).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
-        ttk.Button(out_row, text="Browse Output Folder", command=self._pick_output_folder).pack(side=tk.LEFT)
+        ttk.Button(out_row, text="Browse Output...", command=self._pick_output_folder).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(out_row, text="Open Folder", command=self._open_output_folder).pack(side=tk.LEFT)
 
+        # Options
         ttk.Checkbutton(
-            main,
-            text="Include media files (images, audio, video) — uncheck for instant Code, Event Sheets & JSON Database extraction",
+            m,
+            text="Include media files (images, audio, video) — uncheck for ultra-fast Code, Event Sheets, AOT & JSON Database extraction",
             variable=self.include_media_var,
+            command=self._save_prefs,
         ).pack(anchor="w", pady=(0, 4))
         ttk.Checkbutton(
-            main,
+            m,
             text="Auto-download official engine decompilers & mod injectors when needed (dnSpyEx, Cpp2IL, BepInEx, UE4SS, repak)",
             variable=self.auto_download_var,
-        ).pack(anchor="w", pady=(0, 10))
+            command=self._save_prefs,
+        ).pack(anchor="w", pady=(0, 12))
 
-        # Primary Simple 3-Button Action Row
-        btn_row = ttk.Frame(main)
-        btn_row.pack(fill=tk.X, pady=(0, 6))
+        # Step 3: Clear Primary 3-Button Workflow
+        ttk.Label(m, text="Step 3 — Choose Action:").pack(anchor="w", pady=(0, 4))
+        btn_row = ttk.Frame(m)
+        btn_row.pack(fill=tk.X, pady=(0, 8))
         self.extract_btn = ttk.Button(btn_row, text="1. Extract & Decompile Game", command=self._start_extraction)
         self.extract_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
         self.inject_btn = ttk.Button(
@@ -4781,127 +5124,407 @@ class ExtractorApp(tk.Tk):
             side=tk.LEFT, fill=tk.X, expand=True
         )
 
-        # Secondary Utility Bar
-        util_row = ttk.Frame(main)
+        util_row = ttk.Frame(m)
         util_row.pack(fill=tk.X, pady=(0, 10))
-        ttk.Button(util_row, text="Deploy to Original Game", command=self._start_deploy_modded).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(util_row, text="Restore Original", command=self._start_restore_original).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(util_row, text="Open Output Folder", command=self._open_output_folder).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(util_row, text="Copy Log", command=self._copy_log).pack(side=tk.LEFT)
+        ttk.Button(util_row, text="Deploy to Original Game (Safe .bak)", command=self._start_deploy_modded).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(util_row, text="Restore Original Backup", command=self._start_restore_original).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(util_row, text="Browse Extracted Files ->", command=self._jump_to_files_tab).pack(side=tk.LEFT)
 
-        self.progress = ttk.Progressbar(main, orient=tk.HORIZONTAL, mode="determinate")
-        self.progress.pack(fill=tk.X, pady=(0, 10))
-
-        ttk.Label(main, text="Live Decompilation, Mod Injector & Executable Build Log:").pack(anchor="w")
+        # Compact Live Output Preview on Tab 1
+        ttk.Label(m, text="Live Progress Output (see Tab 3 for full searchable log):").pack(anchor="w")
         self.log_box = tk.Text(
-            main,
-            height=13,
+            m,
+            height=11,
             bg="#11111b",
             fg="#cdd6f4",
             insertbackground="#cdd6f4",
-            font=("Consolas", 10),
+            font=("Consolas", 9),
             wrap=tk.WORD,
         )
         self.log_box.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
 
+    def _build_files_tab(self):
+        f = self.tab_files
+        top = ttk.Frame(f)
+        top.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(top, text="Filter Extracted Files (e.g. .cs, .json, global_variables, rtti, .exe):").pack(side=tk.LEFT, padx=(0, 8))
+        filter_entry = ttk.Entry(top, textvariable=self.file_filter_var, font=("Segoe UI", 10))
+        filter_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        filter_entry.bind("<KeyRelease>", lambda _e: self._apply_file_filter())
+        ttk.Button(top, text="Refresh", command=self._refresh_extracted_files_tree).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(top, text="Open Selected File", command=self._open_selected_extracted_file).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(top, text="Open Folder", command=self._open_selected_file_folder).pack(side=tk.LEFT)
+
+        cols = ("path", "kind", "size")
+        self.file_tree = ttk.Treeview(f, columns=cols, show="headings", selectmode="browse")
+        self.file_tree.heading("path", text="Relative File Path")
+        self.file_tree.heading("kind", text="Category")
+        self.file_tree.heading("size", text="Size")
+        self.file_tree.column("path", width=660)
+        self.file_tree.column("kind", width=150)
+        self.file_tree.column("size", width=110, anchor="e")
+        self.file_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.file_tree.bind("<Double-1>", lambda _e: self._open_selected_extracted_file())
+
+        sb = ttk.Scrollbar(f, orient=tk.VERTICAL, command=self.file_tree.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.file_tree.configure(yscrollcommand=sb.set)
+
+    def _build_logs_tab(self):
+        lg = self.tab_logs
+        ctrl = ttk.Frame(lg)
+        ctrl.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(ctrl, text="Filter:").pack(side=tk.LEFT, padx=(0, 4))
+        cb = ttk.Combobox(ctrl, textvariable=self.log_filter_var, values=["All", "Success [+]", "Warnings/Errors [!]"], state="readonly", width=18)
+        cb.pack(side=tk.LEFT, padx=(0, 8))
+        cb.bind("<<ComboboxSelected>>", lambda _e: self._refresh_full_log_view())
+
+        ttk.Label(ctrl, text="Search:").pack(side=tk.LEFT, padx=(0, 4))
+        s_ent = ttk.Entry(ctrl, textvariable=self.log_search_var, width=24)
+        s_ent.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        s_ent.bind("<KeyRelease>", lambda _e: self._refresh_full_log_view())
+
+        ttk.Button(ctrl, text="Check Toolchain", command=self._check_toolchain_diagnostics).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(ctrl, text="Copy Log", command=self._copy_log).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(ctrl, text="Save Log...", command=self._save_log_file).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(ctrl, text="Clear", command=self._clear_logs).pack(side=tk.LEFT)
+
+        self.full_log_box = tk.Text(
+            lg,
+            bg="#11111b",
+            fg="#cdd6f4",
+            insertbackground="#cdd6f4",
+            font=("Consolas", 9),
+            wrap=tk.WORD,
+        )
+        self.full_log_box.pack(fill=tk.BOTH, expand=True)
+
+    def _bind_shortcuts(self):
+        self.bind("<Control-o>", lambda _e: self._pick_source_folder())
+        self.bind("<Control-O>", lambda _e: self._pick_source_file())
+        self.bind("<Control-Return>", lambda _e: self._start_extraction())
+        self.bind("<F5>", lambda _e: self._scan_installed_games())
+        self.bind("<Escape>", lambda _e: self._cancel_active_task())
+
+    def _save_prefs(self):
+        self.settings.data["output_dir"] = self.output_var.get().strip()
+        self.settings.data["include_media"] = self.include_media_var.get()
+        self.settings.data["auto_download"] = self.auto_download_var.get()
+        self.settings.save()
+
+    def _refresh_recent_combo(self):
+        recents = self.settings.data.get("recent_sources", [])
+        self.recent_combo["values"] = recents
+        if not recents:
+            self.recent_var.set("Recent Games (none)")
+
+    def _scan_installed_games(self):
+        self.quick_game_var.set("Scanning Steam / Epic / GOG / Itch libraries...")
+
+        def worker():
+            games = GameLibraryScanner.scan_installed_games(EngineDetector.resolve_game_context)
+            labels = [
+                f"{g.name}  [{g.engine}{' · ' + g.runtime_hint if g.runtime_hint else ''}]  ({g.launcher})"
+                for g in games
+            ]
+            def update_ui():
+                # Update state strictly on the Tk main thread so index/label lookups can never race!
+                self._installed_games = games
+                self._quick_game_map = dict(zip(labels, games))
+                self.quick_combo["values"] = labels
+                if labels:
+                    self.quick_game_var.set(f"Found {len(labels)} installed game(s) — click to select...")
+                else:
+                    self.quick_game_var.set("No installed Steam/Epic/GOG games found — use Browse Folder/File")
+            self.after(0, update_ui)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_selected_source(self, target_path: Path):
+        """
+        Single unified handler whenever a game is chosen from Quick-Pick, Recent Games, or Browse:
+        sets Step 1 path, scrolls entry into view, resolves engine/runtime, and refreshes the File Explorer!
+        """
+        if not target_path or not target_path.exists():
+            return
+        resolved_str = str(target_path.resolve())
+        self.source_var.set(resolved_str)
+        if hasattr(self, "src_entry"):
+            self.src_entry.delete(0, tk.END)
+            self.src_entry.insert(0, resolved_str)
+            self.src_entry.xview_moveto(1.0)
+        self._update_detected_engine(target_path)
+        self._refresh_extracted_files_tree()
+        self.stage_var.set(f"Selected: {target_path.name} — Ready")
+
+    def _on_source_path_changed(self):
+        raw = self.source_var.get().strip().strip('"')
+        if raw and Path(raw).exists():
+            self._update_detected_engine(Path(raw))
+            self._refresh_extracted_files_tree()
+
+    def _on_quick_game_selected(self, _event=None):
+        chosen_label = self.quick_game_var.get()
+        g = self._quick_game_map.get(chosen_label)
+        if g is None:
+            idx = self.quick_combo.current()
+            if 0 <= idx < len(self._installed_games):
+                g = self._installed_games[idx]
+        if g is not None:
+            self._apply_selected_source(g.path)
+
+    def _on_recent_selected(self, _event=None):
+        chosen = self.recent_var.get().strip()
+        if chosen and Path(chosen).exists():
+            self._apply_selected_source(Path(chosen))
+
     def _pick_source_folder(self):
         folder = filedialog.askdirectory(title="Select Installed Game Folder")
         if folder:
-            self.source_var.set(folder)
-            self._update_detected_engine(Path(folder))
+            self._apply_selected_source(Path(folder))
 
     def _pick_source_file(self):
-        file_path = filedialog.askopenfilename(title="Select Game Executable or Archive (e.g. assets.dat, global-metadata.dat, .pck, .pak, .vpk)")
+        file_path = filedialog.askopenfilename(
+            title="Select Game Executable or Archive (e.g. assets.dat, global-metadata.dat, hlboot.dat, .pck, .pak, .vpk, .wasm)"
+        )
         if file_path:
-            self.source_var.set(file_path)
-            self._update_detected_engine(Path(file_path))
+            self._apply_selected_source(Path(file_path))
 
     def _pick_output_folder(self):
         folder = filedialog.askdirectory(title="Select Output Directory for Extracted & Recompiled Game")
         if folder:
             self.output_var.set(folder)
+            self._save_prefs()
 
     def _open_output_folder(self):
-        out = Path(self.output_var.get().strip())
-        out.mkdir(parents=True, exist_ok=True)
+        ext = self._resolve_active_extracted_dir()
+        target = ext if (ext and ext.is_dir()) else Path(self.output_var.get().strip())
+        target.mkdir(parents=True, exist_ok=True)
         if sys.platform == "win32":
-            os.startfile(str(out))
+            os.startfile(str(target))
 
     def _copy_log(self):
-        content = self.log_box.get("1.0", tk.END).strip()
+        content = "\n".join(self._all_log_lines).strip()
         if content:
             self.clipboard_clear()
             self.clipboard_append(content)
-            messagebox.showinfo("Copied", "Log copied to clipboard.")
+            messagebox.showinfo("Copied", "Full log copied to clipboard.")
+
+    def _save_log_file(self):
+        content = "\n".join(self._all_log_lines).strip()
+        if not content:
+            return
+        save_path = filedialog.asksaveasfilename(defaultextension=".log", filetypes=[("Log files", "*.log"), ("Text files", "*.txt")])
+        if save_path:
+            Path(save_path).write_text(content, encoding="utf-8")
+            messagebox.showinfo("Saved", f"Log saved to:\n{save_path}")
+
+    def _clear_logs(self):
+        self._all_log_lines.clear()
+        self.log_box.delete("1.0", tk.END)
+        self.full_log_box.delete("1.0", tk.END)
+
+    def _refresh_full_log_view(self):
+        filt = self.log_filter_var.get()
+        q = self.log_search_var.get().strip().lower()
+        self.full_log_box.delete("1.0", tk.END)
+        for line in self._all_log_lines:
+            if filt == "Success [+]" and "[+]" not in line and "Successfully" not in line:
+                continue
+            if filt == "Warnings/Errors [!]" and "[!]" not in line and "Error" not in line and "not able" not in line:
+                continue
+            if q and q not in line.lower():
+                continue
+            self.full_log_box.insert(tk.END, line + "\n")
+        self.full_log_box.see(tk.END)
+
+    def _check_toolchain_diagnostics(self):
+        status = DecompilerToolchainManager.setup_all_tools_status(allow_network=False)
+        csc_ok = any(Path(c).is_file() for c in (r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe", r"C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe"))
+        dotnet_ok = bool(shutil.which("dotnet"))
+        self._append_log("\n=== TOOLCHAIN & COMPILER DIAGNOSTICS ===")
+        self._append_log(f"  • Windows C# Compiler (csc.exe for .exe/.dll builds): {'READY' if csc_ok else 'Not Found'}")
+        self._append_log(f"  • .NET SDK (dotnet): {'READY' if dotnet_ok else 'Not Found (optional)'}")
+        self._append_log(status)
+        self.notebook.select(self.tab_logs)
+
+    def _jump_to_files_tab(self):
+        self._refresh_extracted_files_tree()
+        self.notebook.select(self.tab_files)
+
+    def _refresh_extracted_files_tree(self):
+        ext_dir = self._resolve_active_extracted_dir()
+        self._explorer_files.clear()
+        if ext_dir and ext_dir.is_dir():
+            for p in sorted(ext_dir.rglob("*")):
+                if not p.is_file():
+                    continue
+                if "recompiled_build" in p.parts and p.suffix.lower() not in (".exe", ".dat", ".dll", ".json"):
+                    continue
+                rel = p.relative_to(ext_dir).as_posix()
+                ext = p.suffix.lower()
+                if ext == ".exe":
+                    kind = "Executable (.exe)"
+                elif ext in (".cs", ".js", ".ts", ".gd", ".lua", ".rb", ".py", ".hx", ".gml", ".rpy", ".h"):
+                    kind = "Source / Script"
+                elif ext in (".json", ".xml", ".ini", ".cfg", ".md"):
+                    kind = "Data / Report"
+                elif ext in (".dll", ".dat", ".pck", ".pak", ".asar", ".win"):
+                    kind = "Archive / Binary"
+                else:
+                    kind = "Asset"
+                sz = p.stat().st_size
+                sz_str = f"{sz / (1024*1024):.1f} MB" if sz >= 1024 * 1024 else (f"{sz / 1024:.1f} KB" if sz >= 1024 else f"{sz} B")
+                self._explorer_files.append((rel, kind, sz_str, p))
+                if len(self._explorer_files) >= 5000:
+                    break
+        self._apply_file_filter()
+
+    def _apply_file_filter(self):
+        q = self.file_filter_var.get().strip().lower()
+        for item in self.file_tree.get_children():
+            self.file_tree.delete(item)
+        for idx, (rel, kind, sz_str, _p) in enumerate(self._explorer_files):
+            if q and q not in rel.lower() and q not in kind.lower():
+                continue
+            self.file_tree.insert("", tk.END, iid=str(idx), values=(rel, kind, sz_str))
+
+    def _open_selected_extracted_file(self):
+        sel = self.file_tree.selection()
+        if not sel:
+            return
+        idx = int(sel[0])
+        if 0 <= idx < len(self._explorer_files):
+            p = self._explorer_files[idx][3]
+            if p.is_file() and sys.platform == "win32":
+                os.startfile(str(p))
+
+    def _open_selected_file_folder(self):
+        sel = self.file_tree.selection()
+        if not sel:
+            self._open_output_folder()
+            return
+        idx = int(sel[0])
+        if 0 <= idx < len(self._explorer_files):
+            p = self._explorer_files[idx][3].parent
+            if p.is_dir() and sys.platform == "win32":
+                os.startfile(str(p))
 
     def _update_detected_engine(self, path: Path):
         if path.exists():
             root, title, engine = EngineDetector.resolve_game_context(path)
             runtime_hint = ""
             if engine == "Unity":
-                runtime_hint = " (IL2CPP)" if (root / "GameAssembly.dll").is_file() else " (Mono C#)"
-            self.engine_var.set(f"Detected Game: {title}  |  Engine: {engine}{runtime_hint}  |  Root: {root.name}")
+                runtime_hint = " [IL2CPP AOT]" if (root / "GameAssembly.dll").is_file() else " [Mono C#]"
+            elif engine == "GameMaker" and (root / "data.win").is_file():
+                runtime_hint = " [YYC C++ AOT]" if GameMakerYYCAnalyzer.is_yyc_build(root / "data.win") else " [GML VM]"
+            self.engine_var.set(f"Detected: {title}  |  Engine: {engine}{runtime_hint}  |  Root: {root}")
 
     def _resolve_active_extracted_dir(self) -> Path | None:
+        """
+        Resolves the extracted workspace directory specifically for the CURRENTLY SELECTED game in Step 1.
+        CRITICAL FIX: When a game is selected in Step 1, NEVER fall back to an unrelated previously-extracted
+        game folder in `output_dir` (which caused newly picked games to silently act on old games!).
+        """
         out_base = Path(self.output_var.get().strip())
+        src = self.source_var.get().strip().strip('"')
+        if src and Path(src).exists():
+            src_path = Path(src)
+            if src_path.is_dir() and (src_path / "extraction_manifest.json").is_file():
+                return src_path
+            _, game_name, _ = EngineDetector.resolve_game_context(src_path)
+            cand = out_base / f"{game_name}_extracted"
+            return cand if cand.is_dir() else None
+
+        # Only fall back to output_dir itself or its first extracted folder when Step 1 is completely empty
         if (out_base / "extraction_manifest.json").is_file() or (out_base / "decompiled_construct3").is_dir():
             return out_base
-        src = self.source_var.get().strip()
-        if src and Path(src).exists():
-            _, game_name, _ = EngineDetector.resolve_game_context(Path(src))
-            cand = out_base / f"{game_name}_extracted"
-            if cand.is_dir():
-                return cand
         extracted_subdirs = sorted(out_base.glob("*_extracted")) if out_base.is_dir() else []
         return extracted_subdirs[0] if extracted_subdirs else None
 
     def _append_log(self, text: str):
-        self.after(0, lambda: (self.log_box.insert(tk.END, text + "\n"), self.log_box.see(tk.END)))
+        for line in str(text).splitlines():
+            self._all_log_lines.append(line)
+        def _ui():
+            self.log_box.insert(tk.END, str(text) + "\n")
+            self.log_box.see(tk.END)
+            self.full_log_box.insert(tk.END, str(text) + "\n")
+            self.full_log_box.see(tk.END)
+        self.after(0, _ui)
 
     def _update_progress(self, value: float):
-        self.after(0, lambda: self.progress.configure(value=value))
+        def _ui():
+            self.progress.configure(value=value)
+            if self._task_start_ts is not None:
+                elapsed = time.time() - self._task_start_ts
+                self.stage_var.set(f"Working... {value:.0f}%  ({elapsed:.1f}s elapsed)")
+        self.after(0, _ui)
 
-    def _set_busy(self, busy: bool):
+    def _set_busy(self, busy: bool, stage_label: str = "Idle — Ready"):
         state = tk.DISABLED if busy else tk.NORMAL
-        self.after(0, lambda: (self.extract_btn.configure(state=state), self.inject_btn.configure(state=state)))
+        cancel_state = tk.NORMAL if busy else tk.DISABLED
+        if busy:
+            self._task_start_ts = time.time()
+            self.cancel_token.reset()
+        else:
+            self._task_start_ts = None
+        def _ui():
+            self.extract_btn.configure(state=state)
+            self.inject_btn.configure(state=state)
+            self.cancel_btn.configure(state=cancel_state)
+            self.stage_var.set(stage_label)
+            if not busy:
+                self._refresh_extracted_files_tree()
+        self.after(0, _ui)
+
+    def _cancel_active_task(self):
+        if not self.cancel_token.is_cancelled and self._task_start_ts is not None:
+            self.cancel_token.cancel()
+            self._append_log("[!] Cancellation requested — stopping cleanly...")
+            self.stage_var.set("Cancelling...")
 
     def _start_extraction(self):
-        src = self.source_var.get().strip()
-        out = self.output_var.get().strip()
+        src = self.source_var.get().strip().strip('"')
+        out = self.output_var.get().strip().strip('"')
         if not src or not Path(src).exists():
-            messagebox.showwarning("Missing Input", "Please select a valid game file or folder first.")
+            messagebox.showwarning("Missing Input", "Please select an installed game or browse a valid folder/file first.")
             return
         if not out:
             messagebox.showwarning("Missing Output", "Please choose an output folder on your computer.")
             return
 
-        self._set_busy(True)
+        self._save_prefs()
+        self.settings.add_recent_source(src)
+        self._refresh_recent_combo()
+        self._set_busy(True, "Extracting & Decompiling...")
         self.progress.configure(value=0)
-        self.log_box.delete("1.0", tk.END)
+        self._clear_logs()
 
         include_media = self.include_media_var.get()
         allow_net = self.auto_download_var.get()
 
         def worker():
+            t0 = time.time()
             extractor = GameExtractor(
-                self._append_log, self._update_progress, include_media=include_media, allow_network=allow_net
+                self._append_log,
+                self._update_progress,
+                include_media=include_media,
+                allow_network=allow_net,
+                cancel_token=self.cancel_token,
             )
             success, result_msg = extractor.extract(Path(src), Path(out))
+            elapsed = time.time() - t0
             self._append_log("\n" + ("=" * 60))
             self._append_log(result_msg)
-            self._set_busy(False)
-            if not success:
+            self._set_busy(False, f"{'Done' if success else 'Finished with Notice'} in {elapsed:.1f}s")
+            if not success and not self.cancel_token.is_cancelled:
                 self.after(0, lambda: messagebox.showinfo("Extraction Notice", result_msg))
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _start_inject_and_recompile(self):
-        """
-        Automatically decompiles the selected game FIRST if it hasn't been extracted yet,
-        then installs the compatible Mod Injector, recompiles the game, and builds `<GameName>_Modded.exe`!
-        """
-        src = self.source_var.get().strip()
-        out = self.output_var.get().strip()
+        src = self.source_var.get().strip().strip('"')
+        out = self.output_var.get().strip().strip('"')
         ext_dir = self._resolve_active_extracted_dir()
 
         if not ext_dir and (not src or not Path(src).exists()):
@@ -4911,25 +5534,31 @@ class ExtractorApp(tk.Tk):
             messagebox.showwarning("Missing Output", "Please choose an output folder on your computer.")
             return
 
-        self._set_busy(True)
+        self._save_prefs()
+        if src:
+            self.settings.add_recent_source(src)
+            self._refresh_recent_combo()
+        self._set_busy(True, "Auto-Decompiling, Installing Mod Injector & Building .exe...")
         self.progress.configure(value=0)
-        self.log_box.delete("1.0", tk.END)
+        self._clear_logs()
 
         include_media = self.include_media_var.get()
         allow_net = self.auto_download_var.get()
         target_input = ext_dir if (ext_dir and (ext_dir / "extraction_manifest.json").is_file()) else Path(src)
 
         def worker():
+            t0 = time.time()
             mgr = ModInjectorManager(self._append_log, self._update_progress)
-            ok, final_ext_dir, msg = mgr.ensure_decompiled_and_install(
+            ok, _final_ext_dir, msg = mgr.ensure_decompiled_and_install(
                 target_input,
                 output_dir=Path(out),
                 allow_network=allow_net,
                 include_media=include_media,
             )
+            elapsed = time.time() - t0
             self._append_log("\n" + ("=" * 60))
             self._append_log(msg)
-            self._set_busy(False)
+            self._set_busy(False, f"{'Recompiled (.exe Ready!)' if ok else 'Finished with Notice'} in {elapsed:.1f}s")
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -4959,12 +5588,14 @@ class ExtractorApp(tk.Tk):
             messagebox.showwarning("No Extracted Game Found", "Please extract/recompile a game first before deploying.")
             return
         allow_net = self.auto_download_var.get()
+        self._set_busy(True, "Deploying Modded Build (Safe .bak Backup)...")
 
         def worker():
             deployer = SafeDeployManager(self._append_log)
             ok, msg = deployer.deploy_modded_game(ext_dir, launch_after=False, allow_network=allow_net)
             self._append_log("\n" + ("=" * 60))
             self._append_log(msg)
+            self._set_busy(False, "Deployed Safely!" if ok else "Deploy Finished with Notice")
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -4973,12 +5604,14 @@ class ExtractorApp(tk.Tk):
         if not ext_dir:
             messagebox.showwarning("No Extracted Game Found", "Could not find an extracted game workspace with backups.")
             return
+        self._set_busy(True, "Restoring Original Unmodded Game...")
 
         def worker():
             deployer = SafeDeployManager(self._append_log)
             ok, msg = deployer.restore_original_game(ext_dir)
             self._append_log("\n" + ("=" * 60))
             self._append_log(msg)
+            self._set_busy(False, "Original Restored!" if ok else "Restore Notice")
 
         threading.Thread(target=worker, daemon=True).start()
 

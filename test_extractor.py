@@ -768,6 +768,155 @@ class TestGameExtractor(unittest.TestCase):
         self.assertTrue(modded_exe.exists(), f"Expected runnable .exe at {modded_exe}\nLog: {msg}")
         self.assertTrue(modded_exe.read_bytes().startswith(b"MZ"))
 
+    def test_il2cpp_like_aot_runtimes_hashlink_dotnet_singlefile_yyc_luajit_wasm_hxcpp(self):
+        """Tests all newly added IL2CPP-like AOT & Script-to-Native extractors in `codeshift_backend`."""
+        from codeshift_backend import (
+            CancelToken,
+            DotNetSingleFileUnpacker,
+            GameMakerYYCAnalyzer,
+            SettingsManager,
+        )
+
+        # 1. Haxe / HashLink (`hlboot.dat` HLB v5 — Dead Cells, Northgard, Wartales)
+        hl_dir = self.temp_dir / "DeadCellsLike"
+        hl_dir.mkdir()
+        str_blob = b"game.Player\x00game.WeaponDatabase\x00HeroSlash\x00"
+        hl_bytes = (
+            b"HLB\x05"  # magic + v5
+            + bytes([0, 0, 0, 3, 0, 2, 1, 0, 5, 0, 0])  # varuints: flags, nints, nfloats, nstrings, nbytes, ntypes, nglobals, nnatives, nfuncs, nconst, entry
+            + struct.pack("<I", len(str_blob))
+            + str_blob
+        )
+        (hl_dir / "hlboot.dat").write_bytes(hl_bytes)
+        self.assertEqual(EngineDetector.detect(hl_dir), "Haxe / HashLink")
+        ok_hl, msg_hl = self.extractor.extract(hl_dir, self.out_dir)
+        self.assertTrue(ok_hl, msg_hl)
+        hl_out = self.out_dir / "DeadCellsLike_extracted" / "decompiled_hashlink"
+        self.assertTrue((hl_out / "HL_METADATA_REPORT.md").exists())
+        self.assertTrue((hl_out / "RecoveredHashLinkSymbols.hx").exists())
+        self.assertIn("game.Player", json.loads((hl_out / "hl_strings.json").read_text(encoding="utf-8")))
+
+        # 2. .NET Single-File Bundled Executable (`SingleFileHost` v6)
+        sf_exe = self.temp_dir / "SingleFileCSharpGame.exe"
+        embedded_cfg = b'{"difficulty":"hard","maxPlayers":4}'
+        rel_name = b"config/settings.json"
+        # Layout: [MZ stub (64B)] [embedded_cfg] [BundleHeader v6] [8B hdr_off + 32B sig]
+        data_off = 64
+        hdr_off = data_off + len(embedded_cfg)
+        bundle_id = b"TestBundle"
+        header_v6 = (
+            struct.pack("<III", 6, 0, 1)  # major=6, minor=0, file_count=1
+            + bytes([len(bundle_id)]) + bundle_id
+            + (b"\x00" * 40)  # v2+ deps/runtimeconfig/flags offsets
+            + struct.pack("<QQQB", data_off, len(embedded_cfg), 0, 1)
+            + bytes([len(rel_name)]) + rel_name
+        )
+        sf_exe.write_bytes(
+            b"MZ" + (b"\x00" * 62)
+            + embedded_cfg
+            + header_v6
+            + struct.pack("<Q", hdr_off)
+            + DotNetSingleFileUnpacker.BUNDLE_SIGNATURE
+        )
+        self.assertEqual(EngineDetector.detect(sf_exe), ".NET Single-File Bundle")
+        ok_sf, msg_sf = self.extractor.extract(sf_exe, self.out_dir)
+        self.assertTrue(ok_sf, msg_sf)
+        self.assertEqual(
+            (self.out_dir / "SingleFileCSharpGame_extracted" / "unpacked_dotnet_bundle" / "config" / "settings.json").read_bytes(),
+            embedded_cfg,
+        )
+
+        # 3. GameMaker YYC (YoYo Compiler GML->C++ AOT — empty CODE chunk in data.win)
+        yyc_dir = self.temp_dir / "YYCActionGame"
+        yyc_dir.mkdir()
+        yyc_win = yyc_dir / "data.win"
+        gen8 = b"\x00" * 32
+        s1 = b"gml_Script_player_dash"
+        s2 = b"obj_hero_controller"
+        strg_off = 56
+        p0 = strg_off + 12
+        p1 = p0 + 4 + len(s1) + 1
+        strg = struct.pack("<III", 2, p0, p1) + struct.pack("<I", len(s1)) + s1 + b"\x00" + struct.pack("<I", len(s2)) + s2 + b"\x00"
+        body = struct.pack("<4sI", b"GEN8", len(gen8)) + gen8 + struct.pack("<4sI", b"STRG", len(strg)) + strg
+        yyc_win.write_bytes(struct.pack("<4sI", b"FORM", len(body)) + body)
+        self.assertTrue(GameMakerYYCAnalyzer.is_yyc_build(yyc_win))
+        ok_yyc, msg_yyc = self.extractor.extract(yyc_dir, self.out_dir)
+        self.assertTrue(ok_yyc, msg_yyc)
+        self.assertTrue((self.out_dir / "YYCActionGame_extracted" / "decompiled_yyc" / "YYC_GML_STUBS.gml").exists())
+        self.assertIn(
+            "gml_Script_player_dash",
+            (self.out_dir / "YYCActionGame_extracted" / "decompiled_yyc" / "YYC_GML_STUBS.gml").read_text(encoding="utf-8"),
+        )
+
+        # 4. LuaJIT Bytecode (`\x1bLJ` — Hades, Noita, Balatro)
+        lj_file = self.temp_dir / "boss_ai.luac"
+        lj_file.write_bytes(b"\x1bLJ\x02\x00\x00BossAttackPhase\x00FireballDamage\x00")
+        self.assertEqual(EngineDetector.detect(lj_file), "Lua / LuaJIT Bytecode")
+        ok_lj, msg_lj = self.extractor.extract(lj_file, self.out_dir)
+        self.assertTrue(ok_lj, msg_lj)
+        self.assertIn(
+            "BossAttackPhase",
+            (self.out_dir / "boss_ai_extracted" / "decompiled_lua" / "boss_ai.decompiled.lua").read_text(encoding="utf-8"),
+        )
+
+        # 5. WebAssembly (`.wasm` `\x00asm\x01\x00\x00\x00`)
+        wasm_file = self.temp_dir / "physics_engine.wasm"
+        exp_name = b"step_physics"
+        exp_sec = bytes([1, len(exp_name)]) + exp_name + bytes([0, 0])
+        wasm_file.write_bytes(b"\x00asm\x01\x00\x00\x00" + bytes([7, len(exp_sec)]) + exp_sec)
+        self.assertEqual(EngineDetector.detect(wasm_file), "WebAssembly (WASM)")
+        ok_w, msg_w = self.extractor.extract(wasm_file, self.out_dir)
+        self.assertTrue(ok_w, msg_w)
+        exports = json.loads((self.out_dir / "physics_engine_extracted" / "decompiled_wasm" / "physics_engine" / "wasm_exports.json").read_text(encoding="utf-8"))
+        self.assertEqual(exports[0]["name"], "step_physics")
+
+        # 6. Haxe HXCPP (C++ AOT PE Binary with MSVC RTTI Type Descriptors)
+        hxcpp_exe = self.temp_dir / "HaxeFighter.exe"
+        # Minimal valid PE64 header + MSVC RTTI class descriptors + HXCPP marker
+        pe_off = 0x80
+        dos_hdr = b"MZ" + (b"\x00" * (0x3C - 2)) + struct.pack("<I", pe_off) + (b"\x00" * (pe_off - 0x40))
+        pe_hdr = b"PE\x00\x00" + struct.pack("<HHIIIHH", 0x8664, 0, 0, 0, 0, 240, 0x22)
+        opt_hdr = struct.pack("<H", 0x20B) + (b"\x00" * 238)
+        payload = b"hx::Object\x00.?AVCombatManager@Game@@\x00.?AVFighterEntity@Game@@\x00"
+        hxcpp_exe.write_bytes(dos_hdr + pe_hdr + opt_hdr + payload)
+        self.assertEqual(EngineDetector.detect(hxcpp_exe), "Haxe HXCPP (C++ AOT)")
+        ok_hx, msg_hx = self.extractor.extract(hxcpp_exe, self.out_dir)
+        self.assertTrue(ok_hx, msg_hx)
+        rtti = json.loads((self.out_dir / "HaxeFighter_extracted" / "decompiled_native_aot" / "rtti_classes.json").read_text(encoding="utf-8"))
+        self.assertIn("Game::CombatManager", rtti)
+        self.assertIn("Game::FighterEntity", rtti)
+
+        # 7. CancelToken cooperative cancellation & SettingsManager persistence
+        tok = CancelToken()
+        tok.cancel()
+        cancelled_ext = GameExtractor(log_callback=lambda m: None, cancel_token=tok)
+        ok_c, msg_c = cancelled_ext.extract(hl_dir, self.out_dir)
+        self.assertFalse(ok_c)
+        self.assertIn("cancelled", msg_c.lower())
+
+        sm = SettingsManager(self.temp_dir / "test_settings.json")
+        sm.add_recent_source(str(hl_dir))
+        sm2 = SettingsManager(self.temp_dir / "test_settings.json")
+        self.assertEqual(sm2.data["recent_sources"][0], str(hl_dir))
+
+    def test_installed_game_scanner_filtering_and_quick_pick_selection(self):
+        """Regression test for Quick-Pick Installed Game dropdown filtering & active game switching."""
+        from codeshift_backend import GameLibraryScanner
+
+        # 1. Verify non-game folders (DirectXRedist, UE_5.4, Launcher, empty dir) are excluded
+        for non_game in ("DirectXRedist", "GameInputRedist", "Launcher", "UE_5.4", "EmptyLeftover"):
+            d = self.temp_dir / non_game
+            d.mkdir()
+            if non_game == "DirectXRedist":
+                (d / "DXSETUP.exe").write_bytes(b"MZ")
+            self.assertTrue(GameLibraryScanner.is_non_game_dir(d), f"{non_game} should be ignored")
+
+        # 2. Verify real game folder IS accepted
+        real_game = self.temp_dir / "RealIndieGame"
+        real_game.mkdir()
+        (real_game / "RealIndieGame.exe").write_bytes(b"MZ")
+        self.assertFalse(GameLibraryScanner.is_non_game_dir(real_game))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
