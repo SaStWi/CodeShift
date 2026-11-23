@@ -3,8 +3,18 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Extracted game workspaces & backups
+# Environment & secret files (NEVER commit or push)
+.env
+*.env
+.env.*
+
+# Markdown documentation files (NEVER push .md files except README.md)
+*.md
+!README.md
+
+# Extracted game workspaces, builds & backups
 *_extracted/
+recompiled_build/
 backups/
 *.bak
 

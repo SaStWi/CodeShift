@@ -634,6 +634,140 @@ class TestGameExtractor(unittest.TestCase):
         finally:
             DecompilerToolchainManager.TOOLS_ROOT = orig_tools_root
 
+    def test_unity_il2cpp_among_us_global_metadata_decompilation(self):
+        """Tests native Unity IL2CPP `global-metadata.dat` (`0xFAB11BAF`) extraction & C# stub generation (like Among Us)."""
+        among_us = self.temp_dir / "Among Us"
+        meta_dir = among_us / "Among Us_Data" / "il2cpp_data" / "Metadata"
+        meta_dir.mkdir(parents=True)
+        (among_us / "UnityPlayer.dll").write_bytes(b"MZ")
+        (among_us / "GameAssembly.dll").write_bytes(b"MZ")
+
+        # Build valid IL2CPP v29 global-metadata.dat with string literals + identifiers
+        lit1 = b"ImpostorVictory"
+        lit2 = b"EmergencyMeeting"
+        sld_blob = lit1 + lit2
+        str_blob = b"\x00Assembly-CSharp.dll\x00PlayerControl\x00MurderPlayer\x00ShipStatus\x00"
+
+        hdr_size = 64
+        sl_off = hdr_size
+        sl_entries = struct.pack("<IIII", len(lit1), 0, len(lit2), len(lit1))
+        sld_off = sl_off + len(sl_entries)
+        str_off = sld_off + len(sld_blob)
+
+        header = struct.pack(
+            "<IIIIIIII",
+            0xFAB11BAF, 29,
+            sl_off, len(sl_entries),
+            sld_off, len(sld_blob),
+            str_off, len(str_blob),
+        ) + (b"\x00" * (hdr_size - 32))
+        meta_file = meta_dir / "global-metadata.dat"
+        meta_file.write_bytes(header + sl_entries + sld_blob + str_blob)
+
+        self.assertEqual(EngineDetector.detect(among_us), "Unity")
+        ok, msg = self.extractor.extract(among_us, self.out_dir)
+        self.assertTrue(ok, msg)
+        il2cpp_dir = self.out_dir / "Among Us_extracted" / "decompiled_il2cpp"
+        self.assertTrue((il2cpp_dir / "IL2CPP_DUMP_REPORT.md").exists())
+        self.assertTrue((il2cpp_dir / "cs_stubs" / "Among_Us_IL2CPPStubs.cs").exists())
+        idents = json.loads((il2cpp_dir / "il2cpp_identifiers.json").read_text(encoding="utf-8"))
+        lits = json.loads((il2cpp_dir / "string_literals.json").read_text(encoding="utf-8"))
+        self.assertIn("PlayerControl", idents)
+        self.assertIn("MurderPlayer", idents)
+        self.assertIn("ImpostorVictory", lits)
+
+    def test_nested_wrapper_folder_and_new_engines_vpk_pack_pkg(self):
+        """Tests downward wrapper folder detection (like Project Castle) + Source VPK, Total War PFH, and Wallpaper Engine PKG."""
+        # 1. Nested wrapper folder (e.g., Project Castle/Project Castle/UnityPlayer.dll)
+        wrapper = self.temp_dir / "Project Castle"
+        inner = wrapper / "Project Castle"
+        inner.mkdir(parents=True)
+        (inner / "UnityPlayer.dll").write_bytes(b"MZ")
+        root, title, eng = EngineDetector.resolve_game_context(wrapper)
+        self.assertEqual(root, inner)
+        self.assertEqual(eng, "Unity")
+
+        # 2. Source Engine Valve VPK v1
+        vpk_file = self.temp_dir / "CounterStrike_dir.vpk"
+        cfg_data = b"sv_cheats 1\nmp_startmoney 16000\n"
+        tree = (
+            b"cfg\x00"
+            b"scripts\x00"
+            b"autoexec\x00"
+            + struct.pack("<IHHIIH", 0, 0, 0x7FFF, 0, len(cfg_data), 0xFFFF)
+            + b"\x00\x00\x00"
+        )
+        vpk_file.write_bytes(struct.pack("<III", 0x55AA1234, 1, len(tree)) + tree + cfg_data)
+        self.assertEqual(EngineDetector.detect(vpk_file), "Source / Source 2 (VPK)")
+        ok_vpk, msg_vpk = self.extractor.extract(vpk_file, self.out_dir)
+        self.assertTrue(ok_vpk, msg_vpk)
+        self.assertEqual(
+            (self.out_dir / "CounterStrike_dir_extracted" / "CounterStrike_dir" / "scripts" / "autoexec.cfg").read_bytes(),
+            cfg_data,
+        )
+
+        # 3. Total War Warscape PFH4 `.pack`
+        tw_dir = self.temp_dir / "Total War Mock" / "data"
+        tw_dir.mkdir(parents=True)
+        pack_file = tw_dir / "data_rome2.pack"
+        lua_data = b"function OnCampaignStart() end\n"
+        file_idx = struct.pack("<I", len(lua_data)) + b"script/campaign.lua\x00"
+        pack_hdr = b"PFH4" + struct.pack("<IIIIII", 0, 0, 0, 1, len(file_idx), 0)
+        pack_file.write_bytes(pack_hdr + file_idx + lua_data)
+        self.assertEqual(EngineDetector.detect(tw_dir.parent), "Total War (Warscape Pack)")
+        ok_tw, msg_tw = self.extractor.extract(tw_dir.parent, self.out_dir)
+        self.assertTrue(ok_tw, msg_tw)
+        self.assertEqual(
+            (self.out_dir / "Total War Mock_extracted" / "data_rome2" / "script" / "campaign.lua").read_bytes(),
+            lua_data,
+        )
+
+        # 4. Wallpaper Engine PKGV `.pkg`
+        pkg_file = self.temp_dir / "scene.pkg"
+        scene_json = b'{"general":{"fov":60}}'
+        ver = b"PKGV0001"
+        name = b"scene.json"
+        pkg_file.write_bytes(
+            struct.pack("<I", len(ver)) + ver
+            + struct.pack("<I", 1)
+            + struct.pack("<I", len(name)) + name
+            + struct.pack("<II", 0, len(scene_json))
+            + scene_json
+        )
+        self.assertEqual(EngineDetector.detect(pkg_file), "Wallpaper Engine (PKG)")
+        ok_pkg, msg_pkg = self.extractor.extract(pkg_file, self.out_dir)
+        self.assertTrue(ok_pkg, msg_pkg)
+        self.assertEqual(
+            (self.out_dir / "scene_extracted" / "scene" / "scene.json").read_bytes(),
+            scene_json,
+        )
+
+    def test_auto_decompile_before_inject_and_recompiled_exe_generation(self):
+        """Tests that `ensure_decompiled_and_install` decompiles FIRST automatically AND builds a runnable Windows `.exe`."""
+        game_dir = self.temp_dir / "AutoDecompileGame"
+        game_dir.mkdir()
+        (game_dir / "AutoDecompileGame.exe").write_bytes(b"MZ" + b"\x00" * 64)
+        pkg_nw = game_dir / "package.nw"
+        with zipfile.ZipFile(pkg_nw, "w") as zf:
+            zf.writestr("index.html", "<html><body><h1>Play</h1></body></html>")
+            zf.writestr("scripts/c3main.js", "console.log('ready');")
+
+        # Call ensure_decompiled_and_install DIRECTLY on the raw game folder without calling extract() first!
+        out_fresh = self.temp_dir / "FreshOut"
+        mgr = ModInjectorManager(log_callback=lambda m: None)
+        ok, ext_dir, msg = mgr.ensure_decompiled_and_install(
+            game_dir, output_dir=out_fresh, allow_network=False, include_media=True
+        )
+        self.assertTrue(ok, msg)
+        self.assertIsNotNone(ext_dir)
+        self.assertTrue((ext_dir / "index.html").exists())
+        self.assertTrue((ext_dir / "mods" / "mod_loader.js").exists())
+        self.assertTrue((ext_dir / "recompiled_build" / "package.nw").exists())
+        # Verify real Windows PE executable (.exe) was compiled!
+        modded_exe = ext_dir / "AutoDecompileGame_Modded.exe"
+        self.assertTrue(modded_exe.exists(), f"Expected runnable .exe at {modded_exe}\nLog: {msg}")
+        self.assertTrue(modded_exe.read_bytes().startswith(b"MZ"))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
